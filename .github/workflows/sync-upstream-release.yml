@@ -1,0 +1,73 @@
+# Moves this fork to the latest tagged upstream Sink release that is at least
+# MIN_AGE_DAYS old. Cloudflare Workers Builds redeploys on the resulting push.
+# Silent on success; on failure the run fails, and GitHub emails the owner.
+name: Sync upstream release
+
+on:
+  schedule:
+    - cron: '17 9 1 * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  checks: read
+
+env:
+  UPSTREAM: https://github.com/miantiao-me/Sink.git
+  MIN_AGE_DAYS: 7
+
+jobs:
+  sync:
+    if: github.repository == 'howardwkim/Sink'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Pick release
+        id: pick
+        run: |
+          git remote add upstream "$UPSTREAM"
+          git fetch --quiet upstream --tags
+          cutoff=$(date -d "-${MIN_AGE_DAYS} days" +%s)
+          tag=""
+          for t in $(git tag -l 'v*' --sort=-v:refname); do
+            if [ "$(git log -1 --format=%ct "$t")" -le "$cutoff" ]; then tag=$t; break; fi
+          done
+          [ -n "$tag" ] || { echo "No eligible upstream tag"; exit 1; }
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          if git merge-base --is-ancestor "$tag" HEAD; then
+            echo "Already on $tag or later"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Merge and push
+        if: steps.pick.outputs.skip != 'true'
+        id: push
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git merge --no-edit -m "Sync upstream ${{ steps.pick.outputs.tag }}" "${{ steps.pick.outputs.tag }}"
+          git push origin HEAD:${{ github.ref_name }}
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for Cloudflare deploy
+        if: steps.pick.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ steps.push.outputs.sha }}
+        run: |
+          for i in $(seq 1 60); do
+            sleep 30
+            runs=$(gh api "repos/${{ github.repository }}/commits/$SHA/check-runs" \
+              --jq '[.check_runs[] | select(.app.slug | test("cloudflare"))]')
+            [ "$(echo "$runs" | jq length)" -gt 0 ] || continue
+            [ "$(echo "$runs" | jq '[.[] | select(.status != "completed")] | length')" -eq 0 ] || continue
+            bad=$(echo "$runs" | jq '[.[] | select(.conclusion != "success" and .conclusion != "skipped" and .conclusion != "neutral")] | length')
+            [ "$bad" -eq 0 ] && { echo "Deployed ${{ steps.pick.outputs.tag }}"; exit 0; }
+            echo "$runs" | jq -r '.[] | "\(.name): \(.conclusion) \(.details_url)"'
+            exit 1
+          done
+          echo "Timed out waiting for Cloudflare build"
+          exit 1
